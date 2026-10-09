@@ -104,6 +104,7 @@ fi
 grep -q '^RALPH_VERIFY' <<< "$prompt" && verify=1
 
 mode_tag=impl; [ "$verify" -eq 1 ] && mode_tag=verify
+echo "$name|${HARNESS_SESSAO:-}|${HARNESS_SESSAO_NOVA:-}|${MA_SESSAO_NOVA:-}" >> "$state/worker_env.log"
 echo "$mode_tag|$name|fast=${CLAUDE_CODE_DISABLE_FAST_MODE:-}|$argrec|eff=${CLAUDE_CODE_EFFORT_LEVEL:-}" >> "$state/calls.log"
 
 # Grava o modelo pedido para a sessao verificadora (assert do teste de modelo).
@@ -173,6 +174,16 @@ case "$scenario" in
       exit 1
     fi
     ;;
+  limit-codex-hit)
+    # Mensagem real do codex (apostrofo tipografico U+2019). MOCK_RESET_AT vazio
+    # => limite sem horario.
+    if [ "$n" -eq 1 ]; then
+      msg="ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits"
+      [ -n "${MOCK_RESET_AT:-}" ] && msg="$msg or try again at ${MOCK_RESET_AT}."
+      echo "$msg"
+      exit 1
+    fi
+    ;;
 esac
 
 # stall-after-red: escreve no 1o ciclo (teste vermelho), depois trava sem
@@ -230,8 +241,10 @@ MOCK
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
   # sleep espiao: registra cada espera (prova de que houve ou nao espera) e dorme de verdade
+  # MOCK_NOSLEEP=1: registra e NAO dorme (espera de reset ate o dia seguinte).
   printf '#!/usr/bin/env bash
 echo "$*" >> "${MOCK_STATE:?}/sleeps.log"
+[ -n "${MOCK_NOSLEEP:-}" ] && exit 0
 exec %s "$@"
 ' "$(command -v sleep)" > "$bin/sleep"
   chmod +x "$bin/sleep"
@@ -387,6 +400,12 @@ SAILMOCK
   chmod +x "$repo/vendor/bin/sail"
 }
 
+# `composer` no PATH do caso: o preflight exige o executavel; ele roda a suite mock.
+make_composer_stub() {
+  printf '#!/usr/bin/env bash\nexec "$MOCK_TEST_CMD"\n' > "$1/bin/composer"
+  chmod +x "$1/bin/composer"
+}
+
 # new_case <nome> -> ecoa o diretorio do repo fixture
 new_case() {
   local name="$1"
@@ -417,7 +436,7 @@ run_ralph() {
     # -u RALPH_TEST_CMD / RALPH_MAX_CYCLES: o dev pode ter essas exportadas no
     # shell (ex: RALPH_TEST_CMD no .zshrc). Herda-las aqui sobrepoe a deteccao
     # por manifest e quebra os casos 13/16 com uma falha que nao existe no ralph.
-    env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES -u RALPH_MAX_LIMIT_WAITS -u RALPH_DECISOR_MODULE \
+    env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES -u RALPH_MAX_LIMIT_WAITS -u RALPH_SAIL -u RALPH_DECISOR_MODULE \
     PATH="$dir/bin:$CLEAN_PATH" \
     HARNESS_KIT="${CASE_KIT:-$TMP/kit}" \
     TYPESAFE_API_KEY="${CASE_KEY-dummy-chave-de-teste}" \
@@ -789,6 +808,118 @@ if case_enabled sail-override; then
   assert_eq 0 "$rc" "exit 0 (nao checa containers para cmd sem sail)"
   assert_contains "$d/out.log" "comando de teste (--test-cmd)" "override respeitado"
   assert_eq 4 "$(commits "$d")" "fases commitadas"
+  # --test-cmd e a escolha do dono: o ralph nao presume Sail nem no prompt
+  assert_not_contains "$d/out.log" "Sail" "--test-cmd sem sail: nao mencionou Sail"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "$d/test.sh" "prompt traz o comando de teste do dono"
+  assert_not_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Laravel Sail" "prompt nao presume Sail com --test-cmd"
+  assert_not_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Nunca rode essas ferramentas no host" "prompt nao proibe o host com --test-cmd"
+fi
+
+# ---------------------------------------------------------------------------
+# S1. --test-cmd que invoca sail mantem o comportamento de Sail
+# ---------------------------------------------------------------------------
+if case_enabled sail-cmd-uses-sail; then
+  header "S1. --test-cmd com sail mantem Sail (checagem de containers e prompt)"
+  d=$(new_case sail-cmd-uses-sail)
+  make_sail_fixture "$d/repo" up
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "vendor/bin/sail test")
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "Sail: containers de pe" "checou containers (cmd usa sail)"
+  assert_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Nunca rode essas ferramentas no host" "prompt avisa sobre o container"
+
+  d=$(new_case sail-cmd-uses-sail-down)
+  make_sail_fixture "$d/repo" down
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude --test-cmd "vendor/bin/sail test")
+  assert_eq 1 "$rc" "containers parados + cmd com sail: aborta"
+  assert_contains "$d/out.log" "containers nao estao de pe" "abortou pela causa do Sail"
+fi
+
+# ---------------------------------------------------------------------------
+# S2. --no-sail / RALPH_SAIL=0: nunca presume Sail, mesmo detectando-o
+# ---------------------------------------------------------------------------
+if case_enabled no-sail; then
+  header "S2. --no-sail e RALPH_SAIL=0 desligam a deteccao de Sail"
+  d=$(new_case no-sail-flag)
+  make_composer_stub "$d"
+  make_sail_fixture "$d/repo" down   # parado: com Sail presumido o preflight abortaria
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(run_ralph "$d" ok --engine claude --no-sail)
+  assert_eq 0 "$rc" "--no-sail: exit 0 (nao checa containers)"
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "--no-sail: cai no composer test"
+  assert_not_contains "$d/out.log" "Sail" "--no-sail: nao mencionou Sail"
+  assert_not_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Laravel Sail" "--no-sail: prompt sem Sail"
+
+  d=$(new_case no-sail-env)
+  make_composer_stub "$d"
+  make_sail_fixture "$d/repo" down
+  git -C "$d/repo" add -A && git -C "$d/repo" commit -q -m "chore: sail"
+  rc=$(RALPH_SAIL=0 run_ralph_env "$d" ok --engine claude)
+  assert_eq 0 "$rc" "RALPH_SAIL=0: exit 0"
+  assert_contains "$d/out.log" "comando de teste (detectado): composer test" "RALPH_SAIL=0: cai no composer test"
+  assert_not_contains "$d/repo/.phases/prompts/phase-01.cycle-1.txt" "Laravel Sail" "RALPH_SAIL=0: prompt sem Sail"
+
+  grep -qF -- '--no-sail' "$ROOT/scripts/ralph.sh" && grep -qF 'RALPH_SAIL' "$ROOT/scripts/ralph.sh" \
+    && ok "opt-out documentado no cabecalho" || bad "opt-out documentado no cabecalho"
+fi
+
+# ---------------------------------------------------------------------------
+# W1. O agente dentro do ralph e worker: nao delega
+# ---------------------------------------------------------------------------
+if case_enabled worker; then
+  header "W1. sessoes do ralph marcadas como worker e prompts proibem delegar"
+  for eng in claude codex; do
+    d=$(new_case "worker-$eng")
+    # test-red-once: forca ciclo de correcao (prompt fix); verify 'always' cobre o verificador
+    rc=$(run_ralph "$d" test-red-once --engine "$eng" --test-cmd "$d/test.sh")
+    assert_eq 0 "$rc" "$eng: exit 0"
+    n_calls=$(wc -l < "$d/state/worker_env.log" | tr -d ' ')
+    [ "$n_calls" -ge 3 ] && ok "$eng: $n_calls sessoes registradas (impl, correcao, verificador)" || bad "$eng: poucas sessoes ($n_calls)"
+    bad_lines=$(grep -vc "^$eng|worker|0|0$" "$d/state/worker_env.log" || true)
+    assert_eq 0 "$bad_lines" "$eng: toda sessao com HARNESS_SESSAO=worker, HARNESS_SESSAO_NOVA=0, MA_SESSAO_NOVA=0"
+    vp=$(cd "$d/repo/.phases/prompts" && ls phase-01.verify-*.txt 2>/dev/null | head -1)
+    for p in phase-01.cycle-1.txt phase-01.cycle-2.txt "$vp"; do
+      assert_contains "$d/repo/.phases/prompts/$p" "NAO delegue" "$eng: $p proibe delegar"
+      assert_contains "$d/repo/.phases/prompts/$p" "worker do ralph" "$eng: $p diz que e worker"
+    done
+  done
+  # o verificador continua comecando por RALPH_VERIFY (o mock e o gate dependem disso)
+  head -1 "$d/repo/.phases/prompts/$vp" | grep -qx 'RALPH_VERIFY' \
+    && ok "prompt do verificador segue comecando por RALPH_VERIFY" || bad "prompt do verificador perdeu a 1a linha RALPH_VERIFY"
+fi
+
+# ---------------------------------------------------------------------------
+# L1. Codex: "You've hit your usage limit ... try again at 3:46 PM" e limite
+# ---------------------------------------------------------------------------
+if case_enabled limit-codex-hit; then
+  header "L1. codex hit your usage limit -> espera o horario informado"
+  d=$(new_case limit-codex-hit)
+  at=$(date -d '+3 minutes' '+%-I:%M %p')
+  hhmm=$(date -d '+3 minutes' '+%H:%M')
+  rc=$(MOCK_NOSLEEP=1 MOCK_RESET_AT="$at" run_ralph "$d" limit-codex-hit --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0 (limite nao consome ciclo)"
+  assert_eq 3 "$(commits "$d")" "fases commitadas apos a espera"
+  assert_contains "$d/out.log" "Limite de uso atingido" "limite detectado"
+  assert_contains "$d/out.log" "Reset previsto para" "horario de reset extraido"
+  assert_contains "$d/out.log" "$hhmm:00" "reset = $hhmm (try again at $at)"
+  assert_not_contains "$d/out.log" "Sem horario de reset no output" "nao caiu no fallback"
+  assert_eq 3 "$(cat "$d/state/impl_calls")" "mesma fase re-executada 1x (fase 1 duas vezes + fase 2)"
+
+  # horario ja passado hoje -> amanha
+  d=$(new_case limit-codex-hit-tomorrow)
+  at=$(date -d '-3 minutes' '+%-I:%M %p')
+  tomorrow=$(date -d tomorrow '+%d/%m')
+  rc=$(MOCK_NOSLEEP=1 MOCK_RESET_AT="$at" run_ralph "$d" limit-codex-hit --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "horario ja passado: exit 0"
+  assert_contains "$d/out.log" "Reset previsto para $tomorrow" "horario passado hoje => amanha ($tomorrow)"
+
+  # sem horario na mensagem -> fallback existente
+  d=$(new_case limit-codex-hit-notime)
+  rc=$(MOCK_NOSLEEP=1 run_ralph "$d" limit-codex-hit --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "sem horario: exit 0"
+  assert_contains "$d/out.log" "Limite de uso atingido" "sem horario: limite detectado"
+  assert_contains "$d/out.log" "Sem horario de reset no output" "sem horario: fallback de espera"
 fi
 
 # ---------------------------------------------------------------------------

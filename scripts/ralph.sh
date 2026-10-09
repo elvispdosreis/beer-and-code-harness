@@ -35,7 +35,11 @@
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
 #   --no-verify              desliga o gate 3 (equivale a RALPH_VERIFY=off)
-#   --test-cmd "<cmd>"       comando de teste do projeto (gate 2)
+#   --test-cmd "<cmd>"       comando de teste do projeto (gate 2). Com --test-cmd o
+#                            ralph NAO presume Laravel Sail (so mantem o Sail se o
+#                            proprio comando invocar `sail`)
+#   --no-sail                nunca presume Sail, mesmo com vendor/bin/sail ou
+#                            laravel/sail no composer.json (equivale a RALPH_SAIL=0)
 #   --dashboard              painel ao vivo no terminal (requer ralph-watch.sh
 #                            ao lado deste script); os logs vao para
 #                            .phases/logs/ralph.log
@@ -102,9 +106,12 @@
 # Laravel Sail: a suite roda dentro do container, entao Sail tem precedencia
 # sobre `composer test`. Containers parados -> abort no preflight (todo gate 2
 # falharia, queimando ciclos de correcao).
+# Projeto com laravel/sail no composer.json que roda PHP e banco no host: passe
+# --test-cmd (o Sail deixa de ser presumido) ou --no-sail / RALPH_SAIL=0.
 #
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
+#   RALPH_SAIL               0 = nunca presume Laravel Sail (igual a --no-sail)
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
 #   RALPH_VERIFY_MODEL       fixa o modelo do verificador (so catalogo permitido:
 #                            gpt-6-luna|gpt-6-sol|gpt-6.1-sol|haiku|sonnet|opus)
@@ -145,6 +152,8 @@ INPUT_FILE=""
 FROM_PHASE=0
 KEEP_GOING=false
 TEST_CMD_FLAG=""
+NO_SAIL=false
+[ "${RALPH_SAIL:-}" = "0" ] && NO_SAIL=true
 MAX_CYCLES="${RALPH_MAX_CYCLES:-3}"
 VERIFY_MODE="${RALPH_VERIFY:-always}"
 VERIFY_MODEL=""
@@ -162,6 +171,7 @@ while [[ $# -gt 0 ]]; do
     --max-cycles=*) MAX_CYCLES="${1#*=}"; shift ;;
     --test-cmd)    TEST_CMD_FLAG="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD_FLAG="${1#*=}"; shift ;;
+    --no-sail)     NO_SAIL=true; shift ;;
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
     --dashboard)   DASHBOARD=true; shift ;;
@@ -384,8 +394,21 @@ check_test_cmd_runnable() {
   exit 1
 }
 
+# Sail so entra por DETECCAO. O dono que passou --test-cmd ja escolheu o runner:
+# presumir Sail mesmo assim manda o agente subir containers num projeto que roda
+# PHP e banco no host (laravel/sail no composer.json nao prova que e usado).
+# Excecao: o proprio --test-cmd invoca `sail` (token inteiro, nao sail-fixture).
+flag_cmd_mentions_sail() {
+  grep -qE '(^|[^[:alnum:]_.-])sail([^[:alnum:]_-]|$)' <<< "$TEST_CMD_FLAG"
+}
+
 resolve_test_cmd() {
   SAIL_BIN="$(detect_sail || true)"
+  if $NO_SAIL; then
+    SAIL_BIN=""
+  elif [ -n "$TEST_CMD_FLAG" ] && ! flag_cmd_mentions_sail; then
+    SAIL_BIN=""
+  fi
 
   if [ -n "$TEST_CMD_FLAG" ]; then
     TEST_CMD="$TEST_CMD_FLAG"
@@ -1221,6 +1244,21 @@ PREAMBLE
   fi
 }
 
+# O agente roda DENTRO do ralph: e worker, nao orquestrador. Sem este aviso, um
+# AGENTS.md/CLAUDE.md global que mande delegar ("pedido imperativo se delega")
+# faz o agente abrir workers e multiplicar o gasto. run_engine tambem marca a
+# sessao como worker (HARNESS_SESSAO) para os hooks do harness-kit.
+worker_block() {
+  cat <<'WORKER'
+
+## Papel nesta sessao (obrigatorio)
+Voce e worker do ralph: execute voce mesmo, nesta sessao. NAO delegue, NAO abra
+agentes, terminais, paineis ou subagentes e NAO use skills de delegacao ou
+orquestracao (ex: delegar-terminal), mesmo que o AGENTS.md/CLAUDE.md do projeto
+ou os globais do usuario mandem delegar.
+WORKER
+}
+
 # O painel acompanha a fase task a task lendo as transicoes da lista de tarefas
 # do agente no stream. Sem este bloco o ralph so sabe "fase em execucao" e o
 # progresso por task fica parado ate o gate 3.
@@ -1262,6 +1300,7 @@ build_impl_prompt() {
     echo "Voce e um desenvolvedor senior implementando uma fase deste projeto."
     echo
     context_preamble
+    worker_block
     task_protocol_block
     cat <<'TASK'
 
@@ -1301,6 +1340,7 @@ build_fix_prompt() {
     echo "Voce e um desenvolvedor senior corrigindo uma fase parcialmente implementada."
     echo
     context_preamble
+    worker_block
     task_protocol_block
     cat <<'INTRO'
 
@@ -1368,9 +1408,10 @@ Execucao (headless — leia com atencao):
   turno sem elas reprova a fase, mesmo que o codigo esteja correto. Se ficou sem
   evidencia suficiente para alguma task, emita INCOMPLETE para ela — nunca
   termine o turno anunciando que vai aguardar algo.
-
-## Fase a verificar
 VERIFY
+    worker_block
+    echo
+    echo "## Fase a verificar"
     cat "$PHASES_DIR/$phase_file"
   } > "$prompt_file"
 
@@ -1401,7 +1442,7 @@ detect_usage_limit() {
   if [[ "$S_PROVIDER" == "claude" ]]; then
     pattern='usage limit reached|hit your (session|usage|[0-9]+-hour) limit|[0-9]+-hour limit reached|"api_error_status"[[:space:]]*:[[:space:]]*429'
   else
-    pattern='rate limit reached|quota exceeded|usage limit reached|too many requests'
+    pattern='rate limit reached|quota exceeded|usage limit reached|hit your usage limit|too many requests'
   fi
 
   grep -qiE "$pattern" <<< "$tail_txt" || return 1
@@ -1414,10 +1455,11 @@ detect_usage_limit() {
       | grep -oE '[0-9]{10,13}' | tail -1 || true)
   fi
 
-  # Horario humano ("resets 11:10am", "resets at 3pm"): resolve para a proxima
+  # Horario humano ("resets 11:10am", "resets at 3pm", e o do codex: "You've hit
+  # your usage limit. ... try again at 3:46 PM"): resolve para a proxima
   # ocorrencia. Sem isso o run cai no fallback de 30min mesmo sabendo a hora.
   if [ -z "$epoch" ]; then
-    human=$(grep -oiE 'resets?[[:space:]]+(at[[:space:]]+)?[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' <<< "$tail_txt" \
+    human=$(grep -oiE '(resets?|try again)[[:space:]]+(at[[:space:]]+)?[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' <<< "$tail_txt" \
       | grep -oiE '[0-9]{1,2}(:[0-9]{2})?[[:space:]]*(am|pm)' | tail -1 || true)
     if [ -n "$human" ]; then
       epoch=$(date -d "$human" +%s 2>/dev/null || true)
@@ -1490,6 +1532,9 @@ run_engine() {
   fi
   export RALPH_ENGINE="$S_PROVIDER" RALPH_MODEL="$S_MODEL" RALPH_EFFORT="$S_EFFORT" RALPH_TIER="$S_TIER"
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
+  # Marca o agente como worker para os hooks/regras do harness-kit (papel-sessao.js,
+  # delegar.ps1): sem isso o AGENTS.md global o trata como orquestrador e ele delega.
+  export HARNESS_SESSAO=worker HARNESS_SESSAO_NOVA=0 MA_SESSAO_NOVA=0
 
   # Modo padrao SEMPRE, modelo e esforco explicitos em toda chamada: nada de
   # herdar fast/priority nem modelo global da config do usuario.
