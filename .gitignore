@@ -16,3 +16,8 @@ mira-templates/
 .mira/
 CLAUDE.md
 mira.config.json
+# Estado de delegacao gerado em runtime (agentes/prompts/respostas)
+.claude/agentes/
+
+# Chaves locais (JEV): nunca versionar
+.env

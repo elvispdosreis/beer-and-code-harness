@@ -46,12 +46,14 @@ This repository is a Claude Code plugin (`.claude-plugin/plugin.json`). Install 
 
 Commands are namespaced: `/bc-harness:init`, `/bc-harness:plan`, etc. (abbreviated without the namespace throughout this document).
 
-`ralph.sh` is a standalone bash script — copy or reference `scripts/ralph.sh` and run it directly in the target project's repository.
+`ralph.sh` is a standalone bash script — copy or reference `scripts/ralph.sh` and run it directly in the target project's repository. Its model router lives in the same folder: **copy `scripts/ralph-route.js` and `scripts/jev-credential.js` next to `ralph.sh`** (or point `RALPH_ROUTER=<path>` / `RALPH_CREDENTIAL=<path>` at them). Without them ralph aborts at preflight with an explicit message.
 
 **ralph.sh prerequisites:**
 
-- Codex engine: `npm install -g @openai/codex` + `OPENAI_API_KEY`
-- Claude engine: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
+- At least one engine CLI — `--engine auto` (default) offers the router only the CLIs that are installed:
+  - Codex: `npm install -g @openai/codex` + `OPENAI_API_KEY`
+  - Claude: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY`
+- Node ≥ 18 (the router) and the harness-kit decisor that talks to JEV — see [Model routing](#model-routing-jev)
 - Root of a git repository with a **clean** working tree
 
 ## Commands
@@ -161,7 +163,7 @@ With no argument, the input resolves in this order: `.spec/init/project-phases.m
 | 0 | Did the engine actually finish? | claude: `is_error` in the result JSON; codex: exit code |
 | 1 | Did the session write code? | Tree signature before/after. **A signal, not a verdict** — an already-implemented phase makes the engine (correctly) write nothing; the signal feeds the fix-cycle cause |
 | 2 | Does the test suite pass? | Run **by ralph itself**, outside the agent session — the agent cannot "fake green" |
-| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); on the claude engine it uses a cheap model (`sonnet`) |
+| 3 | Is each task actually in the code? | Independent read-only verifier session that emits `TASK <n>: DONE/INCOMPLETE` per task. Runs on every phase by default (`RALPH_VERIFY=always`); its provider/model is chosen by the [router](#model-routing-jev) (never below `balanced` on risky phases) |
 
 Any red gate → **fix cycle**: a fresh session receives the full phase + the real failure cause (never a generic "tests failed"). Default: 3 cycles per phase.
 
@@ -177,7 +179,9 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 
 | Option | Effect |
 |---|---|
-| `--engine codex\|claude` | Implementation engine (default: `codex`) |
+| `--engine auto\|codex\|claude` | `auto` (default): the router picks the provider per session among the installed CLIs. `codex`/`claude` restricts the provider; the router still picks the model tier inside it |
+| `--route-preview` | Prints the routing decision per phase **without running any agent** (offline simulation unless `--route-live`) |
+| `--route-live` | With `--route-preview`: asks JEV for real (one call per phase and mode) |
 | `--from N` | Starts at phase N (clears progress for phases ≥ N) |
 | `--keep-going` | Continues after a phase fails (creates a `wip(phase-N)` commit; default: stop) |
 | `--max-cycles N` | Fix cycles per phase (default: 3) |
@@ -189,13 +193,67 @@ Laravel Sail projects: the suite runs **inside the container** (`vendor/bin/sail
 |---|---|
 | `RALPH_TEST_CMD` | Test command (gate 2) |
 | `RALPH_VERIFY` | Gate 3: `always` (default) \| `auto` (saves tokens: only when gate 2's verdict isn't enough) \| `off` |
-| `RALPH_VERIFY_MODEL` | Verifier model (claude default: `sonnet`) |
+| `RALPH_VERIFY_MODEL` | Pins the verifier model. Only the catalog below is accepted (`gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, `haiku`, `sonnet`, `opus`), from an allowed and installed provider; a pin below the phase's risk floor is rejected |
+| `RALPH_ROUTER` | Path to `ralph-route.js` (default: next to `ralph.sh`) |
+| `HARNESS_KIT` | harness-kit root whose `scripts/decisor.js` is used (default `~/.harness-kit`) |
+| `RALPH_ROUTER_ON_FAIL` | `abort` (default, fail-closed) \| `low` \| `balanced` \| `high` — **explicit** fixed tier when JEV fails; always labelled `fallback-explicito` in log and audit |
+| `RALPH_ROUTER_OFFLINE` | `1` = fixed offline policy without JEV (tests/preview); labelled `OFFLINE` |
+| `TYPESAFE_API_KEY` | JEV key. For CI, set it in the environment (or supply a `.env`). Absent, ralph reads `.env` in the project folder; absent there too, the first interactive run asks for it and saves it to that `.env` |
+| `RALPH_CREDENTIAL` | Path to `jev-credential.js` (default: next to `ralph.sh`) |
+| `RALPH_ROUTER_TIMEOUT_MS` | Timeout of the JEV call (default 30000) |
 | `RALPH_MAX_CYCLES` | Fix cycles per phase (default: 3) |
 | `RALPH_MAX_LIMIT_WAITS` | Consecutive usage-limit waits, per phase (default: 20) |
 | `RALPH_LIMIT_WAIT_DEFAULT` | Fallback wait in seconds (default: 1800) |
 | `RALPH_LIMIT_BUFFER` | Extra seconds after the reset (default: 60) |
 
-During each session, ralph exports `RALPH_ENGINE`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT`, and `RALPH_PHASE_MAX_ATTEMPTS` — useful for notification hooks (e.g. n8n).
+During each session, ralph exports `RALPH_ENGINE` (the provider of that session), `RALPH_MODEL`, `RALPH_EFFORT`, `RALPH_TIER`, `RALPH_PHASE_TITLE`, `RALPH_PHASE_NUM`, `RALPH_PHASE_TOTAL`, `RALPH_PHASE_ATTEMPT`, and `RALPH_PHASE_MAX_ATTEMPTS` — useful for notification hooks (e.g. n8n).
+
+### Model routing (JEV)
+
+Every agent session — each implementation cycle and each independent verifier — gets its provider, model and reasoning effort from **JEV**, the decision model reached through the harness-kit decisor. The goal is the cheapest capable model per session, without a blanket default.
+
+**What decides what**
+
+- **JEV decides** (a model judgement — a heuristic, not a guarantee): the provider (when more than one is allowed), the tier `low | balanced | high`, and a risk class (`none | security | data_loss | architecture`). It receives only a small bounded summary of the *actual phase* (title, tasks, files, signals, a short excerpt, secrets redacted, ≤ 7000 chars) plus, on a fix cycle, the failed gate and a short cause — never the repo, logs or the whole prompt.
+- **ralph-route.js guarantees** (code, checked after every answer): the model catalog, the efforts, the installed CLIs, the cap, the risk floor and standard mode.
+
+| Tier | Codex | Claude |
+|---|---|---|
+| `low` | `gpt-6-luna` · effort `low` | `haiku` · no `--effort` flag |
+| `balanced` | `gpt-6-sol` · `medium` | `sonnet` · `medium` |
+| `high` (cap) | `gpt-6.1-sol` · `high` | `opus` · `high` |
+
+Nothing above Sol / Opus is ever selected, and effort never goes past `high`. The Claude names are the CLI's **aliases** (`haiku`, `sonnet`, `opus`): the Claude Code CLI may re-point an alias to a newer model of the same family. The Codex IDs are explicit. No prices and no savings figures are claimed here.
+
+**Standard mode only.** Every call passes model and effort explicitly, and never inherits a global fast setting: Codex gets `-c service_tier="default"` (the `fast` tier maps to priority processing); Claude gets `CLAUDE_CODE_DISABLE_FAST_MODE=1` plus `--settings '{"fastMode":false}'`. Effort is also pinned per call through `CLAUDE_CODE_EFFORT_LEVEL` (the environment variable overrides skill and subagent effort, per the [Claude Code model configuration docs](https://code.claude.com/docs/en/model-config)): it equals the routed effort, and `low` for Haiku, which gets no `--effort` flag (older alias compatibility) but still has the environment capped so it cannot inherit an expensive effort.
+
+**Rules applied after JEV answers**
+
+- *Risk floor:* a risk class other than `none`, or objective phase signals (security, data migration, concurrency/distribution, architecture), raise the tier to at least `high` for implementation and `balanced` for the verifier. Documentation-only phases ignore the architecture/concurrency signals, and loose words such as "token economy", "lockfile" or a bare "schema" are not signals. `RALPH_VERIFY_MODEL` cannot pin a model below that floor, even when JEV already answered `high`.
+- *Fix cycles:* a meaningful failure (a fix cycle) triggers a new JEV decision with the failure count and cause; the tier may rise but **never drops** below the previous attempt's, and stops at the cap.
+- *Usage limits:* waiting for a usage-limit reset retries the **same** session with the same model — no escalation, no new JEV call.
+- *Provider isolation:* gate 0 always parses the log with the provider of the *implementation* session; the verifier running on another provider cannot corrupt it.
+- *Availability:* only installed CLIs are offered; `--engine codex|claude` restricts to that provider.
+
+**Fail-closed.** If JEV is unreachable, has no credential, or answers something invalid (unknown tier, provider outside the allowed set, bad confidence, not from JEV), ralph **aborts before spending a session**. There is no silent heuristic. Opt-ins, always labelled in the log and in `routes.jsonl`: `RALPH_ROUTER_ON_FAIL=<low|balanced|high>` and `RALPH_ROUTER_OFFLINE=1`.
+
+**Credential.** ralph never reads a key itself. It forces the kit decisor to JEV (`decisor: 'jev'`, `HARNESS_DECISOR=jev` — never the kit's default fallback to another decisor), and that decisor needs `TYPESAFE_API_KEY` (environment or the project `.env`, which the router loads into its own process). Without it you get `jev: sem TYPESAFE_API_KEY` and the abort above. The test suites always use a fake decisor (no network, no key). The live path was validated once against the real JEV (standard Node certificates): `--route-preview --route-live` returned `codex/gpt-6-luna/low`, `source=jev`. The key comes from the environment or the project `.env` (see below); nothing else is persisted. `--route-preview` without `--route-live` is fully offline and works even when `HARNESS_KIT` points to a missing kit.
+
+**Cache and audit.** JEV's raw answer is cached in `.phases/state/route-cache.json`, keyed by policy version, phase content hash, mode, failure count, engine, allowed providers and catalog. An identical request is answered from the cache; each hit is re-validated exactly like a fresh answer, and a corrupted or stale entry is discarded and re-asked. Every decision is appended to `.phases/state/routes.jsonl` (provider, model, effort, tier, source `jev | override | fallback-explicito | offline`, cached, reason, JEV tokens) and logged as `Roteamento [impl|verify] -> provider/model/effort`.
+
+**Preview, without running an agent**
+
+```bash
+./scripts/ralph.sh --route-preview                 # offline SIMULATION (labelled; not JEV's decision)
+./scripts/ralph.sh --route-preview --route-live    # asks JEV for real, one call per phase and mode
+node scripts/ralph-route.js catalog                # the allowed catalog as JSON
+```
+
+**Scope.** This layer applies to the sessions ralph itself starts. It does not make the Claude plugin's native subagents (`agents/`) run on Codex — a cross-vendor swap there is not transparent and is out of scope.
+
+**JEV key.** Lookup order: `TYPESAFE_API_KEY` in the environment, then a `.env` file in the folder you run ralph from (the project root), then — if neither has it and the terminal is interactive — the first run asks once (hidden input) and writes `TYPESAFE_API_KEY` to that `.env`, in plain text, and carries on in the same run. Later runs reuse it and never ask. Other keys and comments in your `.env` are left alone; a blank `TYPESAFE_API_KEY=` line is filled in place. ralph adds `/.env` to `.git/info/exclude` before writing (your tracked `.gitignore` is not touched), so `git add -A` never picks it up; if `.env` is already tracked by git, ralph refuses to write to it — run `git rm --cached .env` first. The `.env` is read by a small parser (`KEY=value`, optional `export`, quotes, `#` comments) — never sourced or executed — and the key never reaches argv, logs or output. Without a terminal ralph stops before any agent and says how to fix it (CI: set `TYPESAFE_API_KEY` or supply a `.env`). Offline preview and `RALPH_ROUTER_OFFLINE=1` never ask; an explicit `RALPH_ROUTER_ON_FAIL` keeps its fallback when there is no terminal. An empty answer, Ctrl-C or an unreadable `.env` writes nothing. A rejected key or a network error is not a missing key: it never prompts or overwrites.
+
+**Where it lives.** The source is this repository (`scripts/ralph-route.js`, `scripts/jev-credential.js`); `~/.harness-kit` is only consulted for the decisor and is never modified.
 
 ### State and progress
 
@@ -311,8 +369,12 @@ agents/                        specifier, clarifier, planner,
                                ai-context-{inspector,core,docs}
 scripts/
   ralph.sh                     phase-by-phase execution orchestrator
+  ralph-route.js               model router (JEV decision, catalog, floors, cache)
+  jev-credential.js            JEV key check: environment, then project .env, else asks once and saves there
   ralph-watch.sh               live run panel (reads .phases/state/)
   test-ralph.sh                red/green suite for ralph with a mock engine
+  test-ralph-route.js          offline tests of the router (fake decisor)
+  test-jev-credential.js       offline tests of the key helper (fake provider)
   check-init-drift.sh          guards against textual drift of the rules
                                duplicated across the init commands
   check-shell.sh               bash -n + shellcheck over scripts/*.sh
@@ -325,6 +387,8 @@ docs/plans/                    internal hardening plans for the harness
 scripts/test-ralph.sh        # ralph.sh suite — fake `claude`/`codex` binaries
                              # on PATH, zero network, zero tokens; exit 0 = green
 scripts/test-ralph.sh <case> # run a single case
+node scripts/test-ralph-route.js  # router tests — fake decisor, zero network
+node scripts/test-jev-credential.js  # key helper tests — temp folders and dummy keys, never a real .env
 scripts/check-shell.sh       # bash -n over all scripts + shellcheck when available
 scripts/check-init-drift.sh  # verbatim anchors for the shared init:* rules
 ```

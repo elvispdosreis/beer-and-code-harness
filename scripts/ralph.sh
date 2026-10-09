@@ -22,7 +22,15 @@
 #   ./ralph.sh [opcoes] [caminho-do-arquivo]
 #
 # Opcoes:
-#   --engine codex|claude    engine de implementacao (default: codex)
+#   --engine auto|codex|claude
+#                            auto (default): o JEV escolhe provedor, modelo e
+#                            esforco por sessao (scripts/ralph-route.js);
+#                            codex|claude restringe o provedor, o JEV ainda
+#                            escolhe a faixa dentro dele
+#   --route-preview          mostra a decisao por fase SEM rodar agente. Offline
+#                            e simulada (nao e o JEV); com --route-live consulta
+#                            o JEV de verdade
+#   --route-live             usa o JEV no --route-preview
 #   --from N                 comeca na fase N (limpa do progresso as fases >= N)
 #   --keep-going             continua apos uma fase falhar (default: para)
 #   --max-cycles N           ciclos de correcao por fase (default: 3)
@@ -64,9 +72,16 @@
 #      roda em toda fase (RALPH_VERIFY=always, default). RALPH_VERIFY=auto
 #      economiza: so roda quando o veredito do gate 2 nao basta — sessao que
 #      nao escreveu nada (claim "ja implementada"), ciclo de correcao, ou
-#      gate 2 desabilitado. --no-verify / RALPH_VERIFY=off desliga. No engine
-#      claude o verificador usa um modelo barato (RALPH_VERIFY_MODEL, default:
-#      sonnet) — e leitura + checklist.
+#      gate 2 desabilitado. --no-verify / RALPH_VERIFY=off desliga. O modelo do
+#      verificador tambem vem do roteador (piso balanced em fase de risco);
+#      RALPH_VERIFY_MODEL fixa um modelo do catalogo permitido.
+#
+# Roteamento de modelo (scripts/ralph-route.js, ao lado deste script):
+#   Faixas low|balanced|high -> codex gpt-6-luna/gpt-6-sol/gpt-6.1-sol,
+#   claude haiku/sonnet/opus (teto: Sol e Opus). Esforco low|medium|high.
+#   Sempre modo padrao: sem fast/priority. Decisao em .phases/state/routes.jsonl.
+#   JEV indisponivel/invalido => o run ABORTA (fail-closed), salvo opt-in
+#   explicito (RALPH_ROUTER_ON_FAIL=<faixa>, RALPH_ROUTER_OFFLINE=1).
 #
 # Gates verdes com a arvore limpa => a fase ja estava implementada em HEAD:
 # marcada como feita, sem commit (nao ha o que commitar).
@@ -91,14 +106,22 @@
 # Variaveis de ambiente:
 #   RALPH_TEST_CMD           comando de teste (gate 2); --test-cmd tem prioridade
 #   RALPH_VERIFY             gate 3: always (default) | auto | off
-#   RALPH_VERIFY_MODEL       modelo do verificador (default: sonnet no claude)
+#   RALPH_VERIFY_MODEL       fixa o modelo do verificador (so catalogo permitido:
+#                            gpt-6-luna|gpt-6-sol|gpt-6.1-sol|haiku|sonnet|opus)
+#   RALPH_ROUTER             caminho do ralph-route.js (default: ao lado deste script)
+#   HARNESS_KIT              raiz do harness-kit (decisor do JEV; default ~/.harness-kit)
+#   RALPH_ROUTER_ON_FAIL     abort (default) | low | balanced | high
+#   RALPH_ROUTER_OFFLINE     1 = politica fixa sem JEV (testes/preview)
+#   TYPESAFE_API_KEY         chave do JEV (CI). Sem ela, vale o .env da pasta; sem .env, o 1o run
+#                            interativo pergunta e grava la; RALPH_CREDENTIAL = jev-credential.js
 #   RALPH_MAX_CYCLES         ciclos de correcao por fase (default: 3)
 #   RALPH_MAX_LIMIT_WAITS    esperas consecutivas por limite, por fase (default: 20)
 #   RALPH_LIMIT_WAIT_DEFAULT fallback de espera em segundos (default: 1800)
 #   RALPH_LIMIT_BUFFER       segundos extras apos o reset (default: 60)
 #
 # Exportadas para hooks (ex: notify-n8n.sh) durante cada sessao de engine:
-#   RALPH_ENGINE             codex | claude
+#   RALPH_ENGINE             provedor da sessao corrente: codex | claude
+#   RALPH_MODEL / RALPH_EFFORT / RALPH_TIER   decisao do roteador para a sessao
 #   RALPH_PHASE_TITLE        titulo da fase corrente
 #   RALPH_PHASE_NUM          numero da fase corrente
 #   RALPH_PHASE_TOTAL        total de fases do run
@@ -108,13 +131,16 @@
 # Exit code: 0 = todas as fases verdes; 1 = alguma falhou ou abortou.
 #
 # Pre-requisitos:
+#   - Node >= 18 (roteador) e o harness-kit com o decisor do JEV (HARNESS_KIT)
 #   - Codex: npm install -g @openai/codex + OPENAI_API_KEY
 #   - Claude: npm install -g @anthropic-ai/claude-code + ANTHROPIC_API_KEY
 #   - Raiz de um repo git, com a arvore de trabalho limpa
 
 set -euo pipefail
 
-ENGINE="codex"
+ENGINE="auto"
+ROUTE_PREVIEW=false
+ROUTE_LIVE=false
 INPUT_FILE=""
 FROM_PHASE=0
 KEEP_GOING=false
@@ -128,6 +154,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine)      ENGINE="$2"; shift 2 ;;
     --engine=*)    ENGINE="${1#*=}"; shift ;;
+    --route-preview) ROUTE_PREVIEW=true; shift ;;
+    --route-live)  ROUTE_LIVE=true; shift ;;
     --from)        FROM_PHASE="$2"; shift 2 ;;
     --from=*)      FROM_PHASE="${1#*=}"; shift ;;
     --max-cycles)  MAX_CYCLES="$2"; shift 2 ;;
@@ -137,7 +165,7 @@ while [[ $# -gt 0 ]]; do
     --keep-going)  KEEP_GOING=true; shift ;;
     --no-verify)   VERIFY_MODE="off"; shift ;;
     --dashboard)   DASHBOARD=true; shift ;;
-    -h|--help)     sed -n '2,82p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0 ;;
     *)             INPUT_FILE="$1"; shift ;;
   esac
 done
@@ -158,6 +186,23 @@ LIMIT_BUFFER="${RALPH_LIMIT_BUFFER:-60}"
 
 TEST_CMD=""
 SAIL_BIN=""
+
+# Roteamento de modelo. ENGINE e o que o usuario pediu (auto|codex|claude).
+# IMPL_PROVIDER e o provedor da sessao de IMPLEMENTACAO da fase (gate 0 e o
+# parse do log dependem dele); S_* descrevem a sessao em curso, que pode ser a
+# do verificador sem corromper o IMPL_PROVIDER.
+AVAILABLE=()
+AVAILABLE_CSV=""
+ROUTER=""
+IMPL_PROVIDER=""
+PHASE_IMPL_TIER=""
+S_PROVIDER=""
+S_MODEL=""
+S_EFFORT=""
+S_TIER=""
+S_SOURCE=""
+S_CACHED=""
+S_REASON=""
 LIMIT_WAITS=0
 # Arquivo da fase corrente: o watcher do stream usa os titulos das tasks para
 # casar um arquivo escrito com a task que o menciona.
@@ -390,9 +435,105 @@ resolve_test_cmd() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Roteamento de modelo (JEV via scripts/ralph-route.js)
+# ---------------------------------------------------------------------------
+
+# Localiza o roteador e valida o contexto SEM chamar agente nem rede: node,
+# arquivo, engine/CLIs, RALPH_VERIFY_MODEL e a presenca do decisor do kit.
+check_router() {
+  ROUTER="${RALPH_ROUTER:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ralph-route.js}"
+  if ! command -v node &> /dev/null; then
+    fail "node nao encontrado: o roteador de modelo (ralph-route.js) precisa de Node >= 18."
+    exit 1
+  fi
+  if [ ! -f "$ROUTER" ]; then
+    fail "Roteador nao encontrado: $ROUTER"
+    fail "Copie scripts/ralph-route.js para o lado do ralph.sh ou aponte RALPH_ROUTER=<caminho>."
+    exit 1
+  fi
+  local out
+  local -a offline=()
+  # preview offline nao exige o decisor do kit; o live continua exigindo
+  if $ROUTE_PREVIEW && ! $ROUTE_LIVE; then offline=(--offline); fi
+  if ! out=$(node "$ROUTER" check --engine "$ENGINE" --available "$AVAILABLE_CSV" --verify-model "$VERIFY_MODEL" "${offline[@]+"${offline[@]}"}" 2>&1); then
+    fail "Roteamento de modelo invalido: $out"
+    exit 1
+  fi
+}
+
+# Chave do JEV: ambiente > .env da pasta; ausente + terminal interativo => pergunta uma vez e
+# grava no .env (fora do git; jev-credential.js). Roda DEPOIS das validacoes baratas e ANTES de qualquer
+# sessao de agente ou mutacao de .phases. Offline nunca pergunta.
+ensure_jev_credential() {
+  [ "${RALPH_ROUTER_OFFLINE:-}" = "1" ] && return 0
+  local cred="${RALPH_CREDENTIAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/jev-credential.js}"
+  if [ ! -f "$cred" ]; then
+    fail "Auxiliar de credencial nao encontrado: $cred"
+    fail "Copie scripts/jev-credential.js para o lado do ralph.sh ou aponte RALPH_CREDENTIAL=<caminho>."
+    exit 1
+  fi
+  # stdin/stderr herdados do terminal: o prompt oculto precisa deles (nada capturado)
+  node "$cred" ensure || exit 1
+}
+
+# route_session <phase_file> <impl|verify> <ciclo>
+# Pergunta ao JEV (via roteador) e preenche S_*. Falha FECHADA: sem decisao
+# valida o run aborta antes de gastar uma sessao de agente. Retry por limite de
+# uso fica dentro do run_engine e NAO passa por aqui (nao reescala, nao rechama).
+route_session() {
+  local phase_file="$1" mode="$2" cycle="$3"
+  local failures=$((cycle - 1)) cause_file="$STATE_DIR/route-cause.txt" err_file="$STATE_DIR/route.err"
+  local -a args=(decide --phase "$PHASES_DIR/$phase_file" --mode "$mode" --engine "$ENGINE"
+    --available "$AVAILABLE_CSV" --failures "$failures"
+    --cache "$STATE_DIR/route-cache.json" --log "$STATE_DIR/routes.jsonl")
+
+  mkdir -p "$STATE_DIR"
+  if [ "$mode" = "impl" ] && [ "$failures" -gt 0 ]; then
+    printf '%s' "$GATE_CAUSE" > "$cause_file"
+    args+=(--gate "$LAST_GATE" --cause-file "$cause_file")
+    [ -n "$PHASE_IMPL_TIER" ] && args+=(--prev-tier "$PHASE_IMPL_TIER")
+  fi
+  [ "$mode" = "verify" ] && [ -n "$VERIFY_MODEL" ] && args+=(--verify-model "$VERIFY_MODEL")
+
+  local out rc=0
+  out=$(node "$ROUTER" "${args[@]}" 2> "$err_file") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "Roteamento de modelo falhou ($mode, fase $phase_file) — abortando antes de gastar uma sessao."
+    head -n 5 "$err_file" | sed 's/^/    /' >&2
+    fail "Sem decisao valida do JEV nao ha heuristica silenciosa. Opt-ins explicitos: RALPH_ROUTER_ON_FAIL=<low|balanced|high>, RALPH_ROUTER_OFFLINE=1."
+    exit 1
+  fi
+
+  S_PROVIDER=""; S_MODEL=""; S_EFFORT=""; S_TIER=""; S_SOURCE=""; S_CACHED=""; S_REASON=""
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      provider) S_PROVIDER="$v" ;;
+      model)    S_MODEL="$v" ;;
+      effort)   S_EFFORT="$v" ;;
+      tier)     S_TIER="$v" ;;
+      source)   S_SOURCE="$v" ;;
+      cached)   S_CACHED="$v" ;;
+      reason)   S_REASON="$v" ;;
+    esac
+  done <<< "$out"
+  S_REASON="${S_REASON%$''}"; S_CACHED="${S_CACHED%$''}"
+
+  if [ -z "$S_PROVIDER" ] || [ -z "$S_MODEL" ] || [ -z "$S_TIER" ]; then
+    fail "Roteador devolveu decisao incompleta: $out"
+    exit 1
+  fi
+
+  local label="$S_PROVIDER/$S_MODEL${S_EFFORT:+/$S_EFFORT}"
+  log "Roteamento [$mode] -> $label (faixa $S_TIER, fonte $S_SOURCE${S_CACHED:+, cache=$S_CACHED})"
+  log "  motivo: $S_REASON"
+  state_meta "route_$mode" "$label · $S_TIER · $S_SOURCE"
+}
+
 preflight_checks() {
-  if [[ "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
-    fail "Engine invalida: $ENGINE. Use 'codex' ou 'claude'."
+  if [[ "$ENGINE" != "auto" && "$ENGINE" != "codex" && "$ENGINE" != "claude" ]]; then
+    fail "Engine invalida: $ENGINE. Use 'auto', 'codex' ou 'claude'."
     exit 1
   fi
 
@@ -414,22 +555,26 @@ preflight_checks() {
       ;;
   esac
 
-  # Verificacao e leitura + checklist: nao precisa do modelo de implementacao.
-  # No codex nao ha default seguro de modelo barato — so aplica se pedido.
-  if [ -n "${RALPH_VERIFY_MODEL:-}" ]; then
-    VERIFY_MODEL="$RALPH_VERIFY_MODEL"
-  elif [[ "$ENGINE" == "claude" ]]; then
-    VERIFY_MODEL="sonnet"
-  fi
+  # So o catalogo permitido entra; o roteador valida (check_router).
+  VERIFY_MODEL="${RALPH_VERIFY_MODEL:-}"
 
-  if ! command -v "$ENGINE" &> /dev/null; then
-    if [[ "$ENGINE" == "codex" ]]; then
-      fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex"
-    else
-      fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code"
-    fi
+  # CLIs que o roteador pode usar: todos os instalados no auto, so o pedido nos
+  # demais. Nunca se oferece ao JEV um provedor sem CLI.
+  local eng
+  for eng in codex claude; do
+    [[ "$ENGINE" == "auto" || "$ENGINE" == "$eng" ]] || continue
+    command -v "$eng" &> /dev/null && AVAILABLE+=("$eng")
+  done
+  if [ ${#AVAILABLE[@]} -eq 0 ]; then
+    case "$ENGINE" in
+      codex)  fail "codex CLI nao encontrado. Instale com: npm install -g @openai/codex" ;;
+      claude) fail "Claude Code CLI nao encontrado. Instale com: npm install -g @anthropic-ai/claude-code" ;;
+      *)      fail "Nenhum CLI de engine encontrado. Instale: npm install -g @openai/codex ou @anthropic-ai/claude-code" ;;
+    esac
     exit 1
   fi
+  AVAILABLE_CSV=$(IFS=,; echo "${AVAILABLE[*]}")
+  check_router
 
   if ! git rev-parse --is-inside-work-tree &> /dev/null 2>&1; then
     fail "Requer um repositorio git."
@@ -456,7 +601,9 @@ preflight_checks() {
 
   resolve_test_cmd
 
-  success "Pre-checks OK (engine: $ENGINE, input: $INPUT_FILE)"
+  ensure_jev_credential
+
+  success "Pre-checks OK (engine: $ENGINE [${AVAILABLE_CSV}], input: $INPUT_FILE)"
 }
 
 # ---------------------------------------------------------------------------
@@ -478,8 +625,20 @@ split_phases() {
     progress_backup=$(cat "$PROGRESS_FILE")
   fi
 
+  # O cache de roteamento (chaveado por conteudo da fase) sobrevive ao re-split:
+  # fase igual => mesma decisao, sem nova consulta ao JEV. E revalidado a cada uso.
+  local route_cache_backup=""
+  if [ -f "$STATE_DIR/route-cache.json" ]; then
+    route_cache_backup=$(cat "$STATE_DIR/route-cache.json")
+  fi
+
   rm -rf "$PHASES_DIR"
   mkdir -p "$PHASES_DIR" "$LOG_DIR" "$PROMPT_DIR"
+
+  if [ -n "$route_cache_backup" ]; then
+    mkdir -p "$STATE_DIR"
+    printf '%s' "$route_cache_backup" > "$STATE_DIR/route-cache.json"
+  fi
 
   # Progresso sobrevive entre execucoes, mas so vale para o MESMO input.
   if [ -n "$progress_backup" ]; then
@@ -1067,7 +1226,7 @@ PREAMBLE
 # progresso por task fica parado ate o gate 3.
 # So faz sentido no claude: o codex nao expoe um stream equivalente.
 task_protocol_block() {
-  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ "$S_PROVIDER" == "claude" ]] || return 0
   cat <<'PROTO'
 
 ## Protocolo de progresso (obrigatorio)
@@ -1239,7 +1398,7 @@ detect_usage_limit() {
   # O denominador comum e api_error_status 429 no JSON de resultado — casar so
   # a frase deixa o limite passar por gate 0 e queima todos os ciclos de
   # correcao em segundos, que e exatamente o que o invariante 4 evita.
-  if [[ "$ENGINE" == "claude" ]]; then
+  if [[ "$S_PROVIDER" == "claude" ]]; then
     pattern='usage limit reached|hit your (session|usage|[0-9]+-hour) limit|[0-9]+-hour limit reached|"api_error_status"[[:space:]]*:[[:space:]]*429'
   else
     pattern='rate limit reached|quota exceeded|usage limit reached|too many requests'
@@ -1325,29 +1484,39 @@ wait_for_reset() {
 run_engine() {
   local prompt_file="$1" log_file="$2" mode="$3"
 
-  export RALPH_ENGINE="$ENGINE"
+  if [ -z "$S_PROVIDER" ] || [ -z "$S_MODEL" ]; then
+    fail "run_engine sem decisao de roteamento (bug): chame route_session antes."
+    exit 1
+  fi
+  export RALPH_ENGINE="$S_PROVIDER" RALPH_MODEL="$S_MODEL" RALPH_EFFORT="$S_EFFORT" RALPH_TIER="$S_TIER"
   export RALPH_PHASE_MAX_ATTEMPTS="$MAX_CYCLES"
 
-  local model_args=()
-  if [[ "$mode" == "verify" ]] && [ -n "$VERIFY_MODEL" ]; then
-    model_args=(--model "$VERIFY_MODEL")
-  fi
+  # Modo padrao SEMPRE, modelo e esforco explicitos em toda chamada: nada de
+  # herdar fast/priority nem modelo global da config do usuario.
+  #   codex : service_tier="default" (fast mapeia para priority) + modelo + esforco
+  #   claude: CLAUDE_CODE_DISABLE_FAST_MODE=1 + fastMode:false + modelo + esforco
+  #           (haiku nao recebe --effort: o roteador devolve esforco vazio; o env
+  #           CLAUDE_CODE_EFFORT_LEVEL vale low nele, para nao herdar esforco caro)
+  local -a codex_args=(-c 'service_tier="default"' --model "$S_MODEL")
+  [ -n "$S_EFFORT" ] && codex_args+=(-c "model_reasoning_effort=\"$S_EFFORT\"")
+  local -a claude_args=(--model "$S_MODEL" --settings '{"fastMode":false}')
+  [ -n "$S_EFFORT" ] && claude_args+=(--effort "$S_EFFORT")
 
   while true; do
     local rc=0
 
-    if [[ "$ENGINE" == "codex" ]]; then
+    if [[ "$S_PROVIDER" == "codex" ]]; then
       if [[ "$mode" == "verify" ]]; then
-        codex exec --sandbox read-only "${model_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        codex exec --sandbox read-only "${codex_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       else
-        codex exec --sandbox danger-full-access - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
+        codex exec --sandbox danger-full-access "${codex_args[@]}" - < "$prompt_file" 2>&1 | tee "$log_file" || rc=$?
       fi
     else
       # < /dev/null: claude -p le stdin quando nao e TTY. Sem o redirect ele
       # consome o stream de quem chamou (ex: o manifest do loop de fases).
       if [[ "$mode" == "verify" ]]; then
-        env -u CLAUDECODE claude --dangerously-skip-permissions \
-          "${model_args[@]}" \
+        env -u CLAUDECODE CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="${S_EFFORT:-low}" claude --dangerously-skip-permissions \
+          "${claude_args[@]}" \
           -p "$(cat "$prompt_file")" \
           --allowedTools "Read,Glob,Grep" \
           --output-format text < /dev/null 2>&1 | tee "$log_file" || rc=$?
@@ -1358,7 +1527,8 @@ run_engine() {
         # O exit code do CLI e sinal fraco; quem decide e o gate 0.
         local quiet=0
         $DASHBOARD && quiet=1
-        if env -u CLAUDECODE claude --dangerously-skip-permissions \
+        if env -u CLAUDECODE CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_EFFORT_LEVEL="${S_EFFORT:-low}" claude --dangerously-skip-permissions \
+             "${claude_args[@]}" \
              -p "$(cat "$prompt_file")" \
              --output-format stream-json --verbose < /dev/null 2>&1 \
              | tee "$log_file" \
@@ -1391,7 +1561,8 @@ GATE_CAUSE=""
 gate0_engine_finished() {
   local log_file="$1" rc="$2"
 
-  if [[ "$ENGINE" == "claude" ]]; then
+  # Provedor da sessao de IMPLEMENTACAO: o verificador (S_PROVIDER) nao o altera.
+  if [[ "$IMPL_PROVIDER" == "claude" ]]; then
     # is_error tem que sair do EVENTO DE RESULTADO, nunca do log inteiro.
     # Com --output-format stream-json o log carrega toda a conversa, e um
     # tool_result de ferramenta que falhou (um grep sem match, um teste
@@ -1505,7 +1676,8 @@ gate3_independent_verify() {
   fi
 
   GATE3_RAN=1
-  log "Gate 3 — sessao verificadora independente ($expected tasks${VERIFY_MODEL:+, modelo: $VERIFY_MODEL})"
+  route_session "$phase_file" verify "$cycle"
+  log "Gate 3 — sessao verificadora independente ($expected tasks, modelo: $S_MODEL, provedor: $S_PROVIDER)"
 
   local prompt_file
   prompt_file=$(build_verify_prompt "$phase_file" "$cycle")
@@ -1575,6 +1747,7 @@ run_phase() {
 
   LIMIT_WAITS=0
   GATE_CAUSE=""
+  PHASE_IMPL_TIER=""
 
   echo ""
   log "[$seq/$total] Phase $phase_num: $phase_title"
@@ -1588,6 +1761,13 @@ run_phase() {
 
     local prompt_file log_file rc=0 sig_before
     log_file="$LOG_DIR/${phase_file%.md}.cycle-${cycle}.log"
+
+    # Uma decisao por ciclo (falha significativa = ciclo de correcao). O prompt
+    # depende do provedor (protocolo de progresso so no claude): roteia antes.
+    # Espera por limite de uso acontece no run_engine e nao passa por aqui.
+    route_session "$phase_file" impl "$cycle"
+    IMPL_PROVIDER="$S_PROVIDER"
+    PHASE_IMPL_TIER="$S_TIER"
 
     if [ "$cycle" -eq 1 ]; then
       prompt_file=$(build_impl_prompt "$phase_file" "$cycle")
@@ -1769,7 +1949,42 @@ on_exit() {
 
 LAST_GATE=""
 
+# --route-preview: mostra o que o roteador decidiria por fase, sem agente e sem
+# tocar no repo. Offline = SIMULACAO rotulada (nao e o JEV); --route-live
+# consulta o JEV de verdade (uma chamada por fase e modo).
+route_preview() {
+  local eng
+  for eng in codex claude; do
+    [[ "$ENGINE" == "auto" || "$ENGINE" == "$eng" ]] || continue
+    command -v "$eng" &> /dev/null && AVAILABLE+=("$eng")
+  done
+  if [ ${#AVAILABLE[@]} -eq 0 ]; then
+    warn "Nenhum CLI de engine instalado: simulando com ${ENGINE/auto/codex,claude} como se estivesse disponivel."
+    AVAILABLE_CSV="${ENGINE/auto/codex,claude}"
+  else
+    AVAILABLE_CSV=$(IFS=,; echo "${AVAILABLE[*]}")
+  fi
+  VERIFY_MODEL="${RALPH_VERIFY_MODEL:-}"
+  resolve_input_file
+  if [ ! -f "$INPUT_FILE" ]; then
+    fail "Arquivo nao encontrado: $INPUT_FILE"
+    exit 1
+  fi
+  check_router
+  local -a live=()
+  if $ROUTE_LIVE; then
+    live=(--live)
+    ensure_jev_credential
+  fi
+  node "$ROUTER" preview "$INPUT_FILE" --engine "$ENGINE" --available "$AVAILABLE_CSV" "${live[@]+"${live[@]}"}"
+}
+
 main() {
+  if $ROUTE_PREVIEW; then
+    route_preview
+    return 0
+  fi
+
   preflight_checks
   split_phases
   apply_from_override

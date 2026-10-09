@@ -33,12 +33,12 @@ assert_eq() {
 
 assert_contains() {
   local haystack_file="$1" needle="$2" msg="$3"
-  if grep -qF "$needle" "$haystack_file"; then ok "$msg"; else bad "$msg (nao achou '$needle')"; fi
+  if grep -qF -- "$needle" "$haystack_file"; then ok "$msg"; else bad "$msg (nao achou '$needle')"; fi
 }
 
 assert_not_contains() {
   local haystack_file="$1" needle="$2" msg="$3"
-  if grep -qF "$needle" "$haystack_file"; then bad "$msg (achou '$needle')"; else ok "$msg"; fi
+  if grep -qF -- "$needle" "$haystack_file"; then bad "$msg (achou '$needle')"; else ok "$msg"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -70,6 +70,13 @@ bump() {
 model=""
 outfmt=""
 
+# Registro do que o ralph realmente passou ao CLI (sem o prompt, que e enorme).
+argrec=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-p" ]; then prev="$a"; continue; fi
+  argrec="$argrec $a"; prev="$a"
+done
+
 if [ "$name" = "claude" ]; then
   # claude -p real le stdin quando nao e TTY: se o ralph nao redirecionar
   # < /dev/null, o mock engole o stream de quem chamou (ex: manifest do loop).
@@ -95,6 +102,9 @@ else
 fi
 
 grep -q '^RALPH_VERIFY' <<< "$prompt" && verify=1
+
+mode_tag=impl; [ "$verify" -eq 1 ] && mode_tag=verify
+echo "$mode_tag|$name|fast=${CLAUDE_CODE_DISABLE_FAST_MODE:-}|$argrec|eff=${CLAUDE_CODE_EFFORT_LEVEL:-}" >> "$state/calls.log"
 
 # Grava o modelo pedido para a sessao verificadora (assert do teste de modelo).
 if [ "$verify" -eq 1 ] && [ -n "$model" ]; then
@@ -219,6 +229,12 @@ MOCK
   chmod +x "$bin/mock-engine"
   cp "$bin/mock-engine" "$bin/claude"
   cp "$bin/mock-engine" "$bin/codex"
+  # sleep espiao: registra cada espera (prova de que houve ou nao espera) e dorme de verdade
+  printf '#!/usr/bin/env bash
+echo "$*" >> "${MOCK_STATE:?}/sleeps.log"
+exec %s "$@"
+' "$(command -v sleep)" > "$bin/sleep"
+  chmod +x "$bin/sleep"
 }
 
 make_testcmd() {
@@ -233,6 +249,10 @@ f="$state/test_calls"; n=0
 [ -f "$f" ] && n=$(cat "$f")
 n=$((n + 1)); echo "$n" > "$f"
 
+if [ "$scenario" = "test-red-always" ]; then
+  echo "sempre vermelho: AlwaysFailTest"
+  exit 1
+fi
 if [ "$scenario" = "test-red-once" ] || [ "$scenario" = "stall-after-red" ]; then
   if [ "$n" -eq 1 ]; then
     echo "1 failing test: ExpectedFooTest"
@@ -244,6 +264,67 @@ exit 0
 TESTCMD
   chmod +x "$1"
 }
+
+# Decisor falso no lugar do JEV: a suite nunca faz rede nem gasta token. E
+# instalado como um harness-kit de mentira (HARNESS_KIT/scripts/decisor.js), o
+# mesmo caminho que o roteador usa em producao. Comportamento por FAKE_JEV_*.
+make_fake_kit() {
+  local kit="$1"
+  mkdir -p "$kit/scripts"
+  cat > "$kit/scripts/decisor.js" <<'FAKEKIT'
+'use strict';
+const fs = require('fs');
+const TIERS = ['low', 'balanced', 'high'];
+exports.decidir = async function (state, questions, opcoes) {
+  const e = process.env;
+  const modo = state.modo && state.modo.startsWith('verificador') ? 'verify' : 'impl';
+  const falhas = state.falhas_significativas || 0;
+  if (e.FAKE_JEV_LOG) {
+    fs.appendFileSync(e.FAKE_JEV_LOG, JSON.stringify({ modo, falhas, state, questions: Object.keys(questions), harnessDecisor: e.HARNESS_DECISOR, opcaoDecisor: opcoes && opcoes.decisor, chaveConfere: e.FAKE_JEV_EXPECT_KEY ? e.TYPESAFE_API_KEY === e.FAKE_JEV_EXPECT_KEY : null }) + '\n');
+  }
+  if (e.FAKE_JEV_FAIL) throw new Error('jev: sem TYPESAFE_API_KEY');
+  let tier = e.FAKE_JEV_TIER || 'balanced';
+  if (modo === 'verify' && e.FAKE_JEV_TIER_VERIFY) tier = e.FAKE_JEV_TIER_VERIFY;
+  if (e.FAKE_JEV_TIER_BY_TITLE) {
+    for (const par of e.FAKE_JEV_TIER_BY_TITLE.split(',')) {
+      const [t, v] = par.split('=');
+      if (state.fase.titulo.includes(t)) tier = v;
+    }
+  }
+  if (e.FAKE_JEV_ESCALATE && modo === 'impl') tier = TIERS[Math.min(falhas, 2)];
+  if (e.FAKE_JEV_TIER_SEQ && modo === 'impl') {
+    const seq = e.FAKE_JEV_TIER_SEQ.split(',');
+    tier = seq[Math.min(falhas, seq.length - 1)];
+  }
+  const ans = {
+    faixa: { choice: e.FAKE_JEV_BAD === 'tier' ? 'ultra' : tier, confidence: 0.9 },
+    risco: { choice: e.FAKE_JEV_RISK || 'none', confidence: 0.9 }
+  };
+  if (questions.provedor) {
+    const oferecidos = Object.keys(questions.provedor.criteria);
+    let p = (modo === 'verify' && e.FAKE_JEV_PROVIDER_VERIFY) || e.FAKE_JEV_PROVIDER || 'codex';
+    if (e.FAKE_JEV_BAD === 'provider') p = 'gemini';
+    else if (!oferecidos.includes(p)) p = oferecidos[0];
+    ans.provedor = { choice: p, confidence: 0.8 };
+  }
+  if (e.FAKE_JEV_BAD === 'conf') ans.faixa.confidence = 7;
+  return { answers: ans, usage: { input_tokens: 100 }, provedor: e.FAKE_JEV_BAD === 'laya' ? 'laya' : 'jev' };
+};
+FAKEKIT
+}
+make_fake_kit "$TMP/kit"
+
+# PATH sem nenhum codex/claude REAL: so os mocks do caso. Garante que a suite
+# nunca chama um agente de verdade e que "CLI ausente" e reproduzivel.
+CLEAN_PATH=""
+IFS=: read -r -a _path_parts <<< "$PATH"
+for _p in "${_path_parts[@]}"; do
+  [ -d "$_p" ] || continue
+  # compgen por padrao: um `ls` com varios args devolve erro se QUALQUER um nao existir
+  if compgen -G "$_p/codex" > /dev/null || compgen -G "$_p/codex.*" > /dev/null      || compgen -G "$_p/claude" > /dev/null || compgen -G "$_p/claude.*" > /dev/null; then continue; fi
+  CLEAN_PATH="$CLEAN_PATH:$_p"
+done
+CLEAN_PATH="${CLEAN_PATH#:}"
 
 PHASES_FIXTURE='# Test Project — Project Phases
 
@@ -336,8 +417,11 @@ run_ralph() {
     # -u RALPH_TEST_CMD / RALPH_MAX_CYCLES: o dev pode ter essas exportadas no
     # shell (ex: RALPH_TEST_CMD no .zshrc). Herda-las aqui sobrepoe a deteccao
     # por manifest e quebra os casos 13/16 com uma falha que nao existe no ralph.
-    env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES -u RALPH_MAX_LIMIT_WAITS \
-    PATH="$dir/bin:$PATH" \
+    env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES -u RALPH_MAX_LIMIT_WAITS -u RALPH_DECISOR_MODULE \
+    PATH="$dir/bin:$CLEAN_PATH" \
+    HARNESS_KIT="${CASE_KIT:-$TMP/kit}" \
+    TYPESAFE_API_KEY="${CASE_KEY-dummy-chave-de-teste}" \
+    FAKE_JEV_LOG="$dir/state/jev.log" \
     MOCK_STATE="$dir/state" \
     MOCK_SCENARIO="$scenario" \
     MOCK_TEST_CMD="$dir/test.sh" \
@@ -357,7 +441,10 @@ run_ralph_env() {
   local rc=0
   (
     cd "$dir/repo" || exit 1
-    PATH="$dir/bin:$PATH" \
+    PATH="$dir/bin:$CLEAN_PATH" \
+    HARNESS_KIT="${CASE_KIT:-$TMP/kit}" \
+    TYPESAFE_API_KEY="${CASE_KEY-dummy-chave-de-teste}" \
+    FAKE_JEV_LOG="$dir/state/jev.log" \
     MOCK_STATE="$dir/state" \
     MOCK_SCENARIO="$scenario" \
     MOCK_TEST_CMD="$dir/test.sh" \
@@ -471,13 +558,12 @@ fi
 if case_enabled false-429; then
   header "7. 429 no meio do log nao dispara espera"
   d=$(new_case false-429)
-  start=$(date +%s)
   rc=$(run_ralph "$d" false-429 --engine codex --test-cmd "$d/test.sh" --max-cycles 1)
-  elapsed=$(($(date +%s) - start))
   assert_eq 0 "$rc" "exit 0"
   assert_not_contains "$d/out.log" "Limite de uso atingido" "nao interpretou 429 de teste como limite"
   assert_contains "$d/repo/.phases/logs/phase-01.cycle-1.log" "429 Too Many Requests" "o 429 realmente estava no log"
-  [ "$elapsed" -lt 5 ] && ok "sem espera (${elapsed}s)" || bad "sem espera (${elapsed}s)"
+  assert_not_contains "$d/out.log" "aguardando" "nenhuma espera de reset anunciada"
+  [ ! -s "$d/state/sleeps.log" ] && ok "sleep nunca invocado (sem espera)" || bad "sleep invocado: $(cat "$d/state/sleeps.log")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -830,6 +916,8 @@ if case_enabled dashboard-degrade; then
   header "26. --dashboard sem ralph-watch.sh -> aviso e segue"
   d=$(new_case dashboard-degrade)
   cp "$RALPH" "$d/ralph-solo.sh"
+  cp "$ROOT/scripts/ralph-route.js" "$d/ralph-route.js"  # roteador mora ao lado do ralph.sh
+  cp "$ROOT/scripts/jev-credential.js" "$d/jev-credential.js"  # auxiliar de credencial tambem
   rc=$(RALPH="$d/ralph-solo.sh" run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh" --dashboard)
   assert_eq 0 "$rc" "exit 0 (run completo mesmo sem o painel)"
   assert_contains "$d/out.log" "nao existe" "avisou que o painel nao esta disponivel"
@@ -849,7 +937,7 @@ if case_enabled live-progress; then
   (
     cd "$d/repo" || exit 1
     env -u RALPH_TEST_CMD -u RALPH_MAX_CYCLES \
-    PATH="$d/bin:$PATH" MOCK_STATE="$d/state" MOCK_SCENARIO=stream-slow \
+    PATH="$d/bin:$CLEAN_PATH" HARNESS_KIT="$TMP/kit" MOCK_STATE="$d/state" MOCK_SCENARIO=stream-slow \
     MOCK_TEST_CMD="$d/test.sh" MOCK_SLOW_SECS=6 RALPH_VERIFY=off \
       bash "$RALPH" --engine claude --test-cmd "$d/test.sh" > "$d/out.log" 2>&1
   ) &
@@ -1375,6 +1463,387 @@ if case_enabled watch-frame; then
   else
     ok "tmux ausente — integracao do quadro pulada"
   fi
+fi
+
+# ===========================================================================
+# Roteamento de modelo (JEV) — integracao com o ralph.sh de verdade.
+# Decisor FALSO (fake kit) e CLIs mock: nenhuma rede, nenhum agente real.
+# Os testes do roteador isolado ficam em scripts/test-ralph-route.js.
+# ===========================================================================
+
+calls_log() { cat "$1/state/calls.log" 2>/dev/null || true; }
+n_calls() { calls_log "$1" | grep -ac "^$2|" || true; }
+jev_n() { [ -f "$1/state/jev.log" ] && grep -ac '' "$1/state/jev.log" || echo 0; }
+models_of() { calls_log "$1" | grep -a "^$2|" | sed -n 's/.*--model \([^ ]*\).*/\1/p' | paste -sd, -; }
+
+# Modo padrao em TODA chamada de CLI: codex com service_tier="default", modelo e
+# esforco explicitos; claude com fast desligado por env e por settings.
+assert_standard_mode() {
+  local d="$1" label="$2" bad_lines
+  bad_lines=$(calls_log "$d" | grep -a '^[a-z]*|codex|' | grep -avc 'service_tier="default".*--model [a-z0-9.-]*.*model_reasoning_effort="\(low\|medium\|high\)"' || true)
+  assert_eq 0 "$bad_lines" "$label: toda chamada codex com service_tier default + modelo + esforco"
+  bad_lines=$(calls_log "$d" | grep -a '^[a-z]*|claude|' | grep -avc '^[a-z]*|claude|fast=1| .*--model [a-z]* --settings {"fastMode":false}' || true)
+  assert_eq 0 "$bad_lines" "$label: toda chamada claude com fast=1 + fastMode:false + modelo"
+  # CLAUDE_CODE_EFFORT_LEVEL (o env vence skill/subagent): igual ao --effort roteado; haiku (sem --effort) = low
+  bad_lines=$(calls_log "$d" | grep -a '^[a-z]*|claude|' | awk '{ e="low"; if (match($0, /--effort [a-z]+/)) e=substr($0, RSTART+9, RLENGTH-9); if ($0 !~ ("\\|eff=" e "$")) n++ } END { print n+0 }' || true)
+  assert_eq 0 "$bad_lines" "$label: toda chamada claude (impl e verify) com CLAUDE_CODE_EFFORT_LEVEL = esforco roteado (low no haiku)"
+  bad_lines=$(calls_log "$d" | grep -aci 'priority\|fast_mode\|"fast"' || true)
+  assert_eq 0 "$bad_lines" "$label: nenhum argumento de fast/priority"
+}
+
+# ---------------------------------------------------------------------------
+# R1. --engine auto (default): provedor por sessao, fast herdado bloqueado,
+#     provedores diferentes em impl e verify, trilha de auditoria
+# ---------------------------------------------------------------------------
+if case_enabled route-auto; then
+  header "R1. engine auto (default): impl codex + verificador claude"
+  d=$(new_case route-auto)
+  # fast HERDADO ligado no ambiente do usuario: o ralph tem que sobrepor
+  rc=$(FAKE_JEV_TIER=balanced FAKE_JEV_PROVIDER=codex FAKE_JEV_PROVIDER_VERIFY=claude CLAUDE_CODE_DISABLE_FAST_MODE=0 \
+       run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 sem --engine (default auto)"
+  assert_eq 3 "$(commits "$d")" "uma fase por commit"
+  assert_eq "gpt-6-sol,gpt-6-sol" "$(models_of "$d" impl)" "implementacao no codex gpt-6-sol"
+  assert_eq "sonnet,sonnet" "$(models_of "$d" verify)" "verificador no claude sonnet (provedor diferente do impl)"
+  assert_contains "$d/state/calls.log" 'impl|codex|fast=0| exec --sandbox danger-full-access -c service_tier="default" --model gpt-6-sol -c model_reasoning_effort="medium" -' "argumentos exatos da implementacao codex"
+  assert_contains "$d/state/calls.log" '--dangerously-skip-permissions --model sonnet --settings {"fastMode":false} --effort medium' "verificador claude com modelo, fastMode:false e esforco"
+  assert_standard_mode "$d" "auto"
+  assert_eq 4 "$(jev_n "$d")" "uma consulta ao JEV por sessao (2 fases x impl/verify)"
+  assert_eq 4 "$(grep -ac '"source":"jev"' "$d/repo/.phases/state/routes.jsonl")" "routes.jsonl audita as 4 decisoes com fonte jev"
+  assert_contains "$d/out.log" "Roteamento [impl] -> codex/gpt-6-sol/medium" "log mostra provedor/modelo/esforco da implementacao"
+  assert_contains "$d/out.log" "Roteamento [verify] -> claude/sonnet/medium" "log mostra a decisao do verificador"
+  assert_contains "$d/out.log" "motivo: JEV: faixa balanced" "log explica o motivo"
+  assert_contains "$d/state/jev.log" '"harnessDecisor":"jev"' "decisor forcado em jev"
+  assert_contains "$d/state/jev.log" '"opcaoDecisor":"jev"' "opcao decisor=jev passada ao kit"
+fi
+
+# gate 0 le o log do provedor da IMPLEMENTACAO: verificador de outro provedor nao
+# pode corromper isso, nem no ciclo de correcao que vem depois dele.
+if case_enabled route-gate0-isolation; then
+  header "R2. isolamento gate 0: impl claude + verificador codex + ciclo de correcao"
+  d=$(new_case route-gate0-isolation)
+  rc=$(FAKE_JEV_TIER=balanced FAKE_JEV_PROVIDER=claude FAKE_JEV_PROVIDER_VERIFY=codex FAKE_JEV_TIER_VERIFY=high \
+       run_ralph "$d" verify-incomplete-once --test-cmd "$d/test.sh" --max-cycles 2)
+  assert_eq 0 "$rc" "exit 0 (verificador INCOMPLETE 1x, depois DONE)"
+  assert_not_contains "$d/out.log" "Gate 0 vermelho" "gate 0 nunca confundiu o log claude com o do verificador codex"
+  assert_contains "$d/out.log" "Ciclo de correcao 2/2" "houve ciclo de correcao depois do verificador"
+  assert_contains "$d/state/calls.log" 'verify|codex|fast=| exec --sandbox read-only -c service_tier="default" --model gpt-6.1-sol -c model_reasoning_effort="high" -' "verificador codex read-only, Sol, esforco high"
+  assert_eq 3 "$(n_calls "$d" impl)" "tres sessoes de implementacao (fase 1 em 2 ciclos + fase 2)"
+  assert_eq "claude" "$(calls_log "$d" | grep -a '^impl|' | cut -d'|' -f2 | sort -u)" "toda implementacao seguiu no claude"
+  assert_standard_mode "$d" "isolamento"
+fi
+
+# ---------------------------------------------------------------------------
+# R3. engine explicito restringe o provedor; so o CLI instalado e oferecido
+# ---------------------------------------------------------------------------
+if case_enabled route-explicit; then
+  header "R3. --engine explicito restringe o provedor"
+  d=$(new_case route-explicit)
+  rc=$(FAKE_JEV_PROVIDER=codex run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 (--engine claude)"
+  assert_eq 0 "$(calls_log "$d" | grep -ac '|codex|' || true)" "nenhuma chamada codex em --engine claude"
+  assert_not_contains "$d/state/jev.log" '"provedor"' "JEV nem foi perguntado sobre provedor (so um permitido)"
+  assert_standard_mode "$d" "claude explicito"
+
+  d2=$(new_case route-explicit-codex)
+  rc=$(FAKE_JEV_PROVIDER=claude run_ralph "$d2" ok --engine codex --test-cmd "$d2/test.sh")
+  assert_eq 0 "$rc" "exit 0 (--engine codex)"
+  assert_eq 0 "$(calls_log "$d2" | grep -ac '|claude|' || true)" "nenhuma chamada claude em --engine codex"
+  assert_standard_mode "$d2" "codex explicito"
+fi
+
+if case_enabled route-installed-only; then
+  header "R4. so o CLI instalado e oferecido"
+  d=$(new_case route-installed-only)
+  rm -f "$d/bin/claude"
+  rc=$(FAKE_JEV_PROVIDER=claude run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "exit 0 (auto com so o codex instalado)"
+  assert_eq 0 "$(calls_log "$d" | grep -ac '|claude|' || true)" "nenhuma chamada claude"
+  assert_not_contains "$d/state/jev.log" '"provedor"' "JEV nao e perguntado sobre provedor que nao existe"
+  assert_contains "$d/out.log" "engine: auto [codex]" "pre-check lista so os CLIs disponiveis"
+
+  d2=$(new_case route-no-cli)
+  rm -f "$d2/bin/claude"
+  rc=$(run_ralph "$d2" ok --engine claude --test-cmd "$d2/test.sh")
+  assert_eq 1 "$rc" "exit 1 (--engine claude sem claude instalado)"
+  assert_contains "$d2/out.log" "Claude Code CLI nao encontrado" "mensagem de CLI ausente"
+  assert_eq 0 "$(n_calls "$d2" impl)" "nenhum agente rodou"
+fi
+
+# ---------------------------------------------------------------------------
+# R5. limite de uso: mesma sessao, mesmo modelo, sem nova consulta ao JEV
+# ---------------------------------------------------------------------------
+if case_enabled route-usage-retry; then
+  header "R5. espera por limite de uso nao reescala nem reconsulta o JEV"
+  d=$(new_case route-usage-retry)
+  rc=$(FAKE_JEV_ESCALATE=1 run_ralph "$d" limit-epoch --engine claude --test-cmd "$d/test.sh" --max-cycles 1)
+  assert_eq 0 "$rc" "exit 0 (limite nao consome ciclo)"
+  assert_contains "$d/out.log" "Limite de uso atingido" "limite detectado"
+  assert_eq 3 "$(n_calls "$d" impl)" "fase 1 rodou duas vezes (retry) + fase 2"
+  l1=$(calls_log "$d" | grep -a '^impl|' | sed -n 1p); l2=$(calls_log "$d" | grep -a '^impl|' | sed -n 2p)
+  assert_eq "$l1" "$l2" "retry usa exatamente o mesmo modelo/esforco/argumentos"
+  assert_eq 4 "$(jev_n "$d")" "JEV consultado so 4x (2 fases x impl/verify): o retry nao chamou de novo"
+  assert_eq "haiku,haiku,haiku" "$(models_of "$d" impl)" "sem escalonamento por limite de uso (falha 0 => faixa low)"
+  [ -s "$d/state/sleeps.log" ] && ok "sleep invocado na espera de reset (retry real)" || bad "retry por limite sem sleep"
+fi
+
+# ---------------------------------------------------------------------------
+# R6. modelo imposto (RALPH_VERIFY_MODEL) so do catalogo permitido
+# ---------------------------------------------------------------------------
+if case_enabled route-model-reject; then
+  header "R6. RALPH_VERIFY_MODEL fora do catalogo/provedor e rejeitado"
+  for m in gpt-6-fast astra fable gpt-7 opus-max; do
+    d=$(new_case "route-reject-$m")
+    rc=$(CASE_VERIFY_MODEL="$m" run_ralph "$d" ok --engine auto --test-cmd "$d/test.sh")
+    assert_eq 1 "$rc" "'$m' rejeitado (exit 1)"
+    assert_contains "$d/out.log" "fora do catalogo permitido" "'$m': motivo explicito"
+    assert_eq 0 "$(n_calls "$d" impl)" "'$m': rejeitado ANTES de gastar uma sessao"
+  done
+  d=$(new_case route-reject-provider)
+  rc=$(CASE_VERIFY_MODEL=opus run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "opus com --engine codex rejeitado"
+  assert_contains "$d/out.log" "fora do permitido/disponivel" "provedor fora do permitido explicado"
+  d=$(new_case route-model-ok)
+  rc=$(CASE_VERIFY_MODEL=haiku run_ralph "$d" ok --engine claude --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "haiku e aceito"
+  assert_eq "haiku,haiku" "$(models_of "$d" verify)" "verificador no modelo fixado"
+  assert_not_contains "$d/state/calls.log" "verify|claude|fast=1| --dangerously-skip-permissions --model haiku --settings {\"fastMode\":false} --effort" "haiku nao recebe --effort"
+  assert_contains "$d/out.log" "fonte override" "fonte override registrada"
+fi
+
+if case_enabled route-override-floor; then
+  header "R7. override nao fura o piso de risco (JEV ja em high + seguranca)"
+  d=$(new_case route-override-floor)
+  rc=$(FAKE_JEV_TIER=high FAKE_JEV_RISK=security CASE_VERIFY_MODEL=gpt-6-luna \
+       run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "exit 1: verificador barato em fase de seguranca e recusado"
+  assert_contains "$d/out.log" "abaixo do piso de risco" "motivo do piso explicado"
+  assert_eq 0 "$(n_calls "$d" verify)" "verificador nunca rodou com o modelo abaixo do piso"
+  d2=$(new_case route-override-free)
+  rc=$(FAKE_JEV_TIER=high FAKE_JEV_RISK=none CASE_VERIFY_MODEL=gpt-6-luna \
+       run_ralph "$d2" ok --engine codex --test-cmd "$d2/test.sh")
+  assert_eq 0 "$rc" "sem risco ativo o modelo fixado pelo usuario vale"
+  assert_eq "gpt-6-luna,gpt-6-luna" "$(models_of "$d2" verify)" "verificador no modelo fixado"
+fi
+
+# ---------------------------------------------------------------------------
+# R8. escalonamento por falha significativa: limitado e sem descer
+# ---------------------------------------------------------------------------
+if case_enabled route-escalation; then
+  header "R8. retry sobe de faixa, para no teto Sol e nunca desce"
+  d=$(new_case route-escalation)
+  rc=$(FAKE_JEV_ESCALATE=1 run_ralph "$d" test-red-always --engine codex --test-cmd "$d/test.sh" --max-cycles 4)
+  assert_eq 1 "$rc" "exit 1 (gate 2 sempre vermelho)"
+  assert_eq "gpt-6-luna,gpt-6-sol,gpt-6.1-sol,gpt-6.1-sol" "$(models_of "$d" impl)" "luna -> sol -> 6.1-sol e fica no teto"
+  assert_not_contains "$d/state/calls.log" "gpt-7" "nada acima do teto"
+  assert_standard_mode "$d" "escalonamento"
+  assert_eq 4 "$(jev_n "$d")" "uma consulta ao JEV por ciclo de correcao (falha significativa)"
+  # contexto de falha entregue ao (fake) decisor: ausente na 1a sessao, presente (<=400 chars de causa) nas seguintes
+  ctx=$(node -e '
+    const l = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map((x) => JSON.parse(x).state);
+    const ok = !("ultima_falha" in l[0]) && l.slice(1).every((s) => s.falhas_significativas > 0 && s.ultima_falha && s.ultima_falha.gate && s.ultima_falha.causa.length > 0 && s.ultima_falha.causa.length <= 401);
+    process.stdout.write(ok ? "ok" : "ruim: " + JSON.stringify(l.map((s) => [s.falhas_significativas, s.ultima_falha])));
+  ' "$d/state/jev.log")
+  assert_eq ok "$ctx" "JEV recebe ultima_falha (gate + causa <=400) so apos falha; contagem de falhas preservada"
+
+  d2=$(new_case route-no-downgrade)
+  rc=$(FAKE_JEV_TIER_SEQ=high,low,low run_ralph "$d2" test-red-always --engine codex --test-cmd "$d2/test.sh" --max-cycles 3)
+  assert_eq 1 "$rc" "exit 1"
+  assert_eq "gpt-6.1-sol,gpt-6.1-sol,gpt-6.1-sol" "$(models_of "$d2" impl)" "JEV pediu low depois da falha: o ralph nao desce"
+  assert_contains "$d2/repo/.phases/state/routes.jsonl" "nao desce de high" "piso de nao-descida registrado no motivo"
+fi
+
+# ---------------------------------------------------------------------------
+# R9. fail-closed: sem decisao valida do JEV o run aborta antes de gastar sessao
+# ---------------------------------------------------------------------------
+if case_enabled route-failclosed; then
+  header "R9. JEV indisponivel/invalido => aborta (fail-closed)"
+  d=$(new_case route-jev-down)
+  rc=$(FAKE_JEV_FAIL=1 run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "exit 1 com JEV fora do ar"
+  assert_contains "$d/out.log" "Roteamento de modelo falhou" "falha explicada"
+  assert_contains "$d/out.log" "sem TYPESAFE_API_KEY" "causa original visivel"
+  assert_eq 0 "$(n_calls "$d" impl)" "nenhum agente rodou"
+  assert_eq 1 "$(commits "$d")" "nenhum commit"
+  assert_not_contains "$d/out.log" "Roteamento [impl]" "nenhuma decisao heuristica silenciosa"
+  for bad in tier provider conf laya; do
+    d=$(new_case "route-bad-$bad")
+    rc=$(FAKE_JEV_BAD="$bad" run_ralph "$d" ok --test-cmd "$d/test.sh")
+    assert_eq 1 "$rc" "resposta invalida do JEV ($bad) => exit 1"
+    assert_eq 0 "$(n_calls "$d" impl)" "resposta invalida ($bad): nenhum agente rodou"
+  done
+  d=$(new_case route-explicit-fallback)
+  rc=$(FAKE_JEV_FAIL=1 RALPH_ROUTER_ON_FAIL=low run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "RALPH_ROUTER_ON_FAIL=low e opt-in explicito"
+  assert_contains "$d/repo/.phases/state/routes.jsonl" '"source":"fallback-explicito"' "fallback rotulado como tal na auditoria"
+  assert_contains "$d/out.log" "fonte fallback-explicito" "fallback rotulado no log"
+  assert_eq "gpt-6-luna,gpt-6-luna" "$(models_of "$d" impl)" "faixa fixa pedida"
+fi
+
+# ---------------------------------------------------------------------------
+# R10. cache: decisao identica nao reconsulta; entrada corrompida e descartada
+# ---------------------------------------------------------------------------
+if case_enabled route-cache; then
+  header "R10. cache de decisao validado como resposta nova"
+  d=$(new_case route-cache)
+  rc=$(FAKE_JEV_PROVIDER=codex run_ralph "$d" ok --engine auto --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "run 1 verde"
+  assert_eq 4 "$(jev_n "$d")" "run 1: 4 consultas ao JEV"
+  rc=$(FAKE_JEV_PROVIDER=codex run_ralph "$d" ok --engine auto --test-cmd "$d/test.sh" --from 2)
+  assert_eq 0 "$rc" "run 2 (--from 2) verde"
+  assert_eq 4 "$(jev_n "$d")" "run 2: decisoes identicas vieram do cache, sem chamar o JEV"
+  assert_contains "$d/out.log" "cache=true" "log indica cache"
+  node -e '
+    const fs=require("fs"), f=process.argv[1], c=JSON.parse(fs.readFileSync(f,"utf8"));
+    for (const k of Object.keys(c)) c[k].faixa.choice="ultra";
+    fs.writeFileSync(f, JSON.stringify(c));' "$d/repo/.phases/state/route-cache.json"
+  rc=$(FAKE_JEV_PROVIDER=codex run_ralph "$d" ok --engine auto --test-cmd "$d/test.sh" --from 2)
+  assert_eq 0 "$rc" "run 3 verde mesmo com cache corrompido"
+  assert_eq 6 "$(jev_n "$d")" "run 3: entradas corrompidas descartadas e o JEV consultado de novo (fase 2: impl + verify)"
+  rc=$(FAKE_JEV_PROVIDER=codex run_ralph "$d" ok --engine auto --test-cmd "$d/test.sh" --from 2)
+  assert_eq 0 "$rc" "run 4 verde"
+  assert_eq 6 "$(jev_n "$d")" "run 4: cache da fase 2 reparado pela consulta anterior (sem nova chamada)"
+fi
+
+# ---------------------------------------------------------------------------
+# R11. preview sem agente: offline simulado e rotulado; ao vivo so com --route-live
+# ---------------------------------------------------------------------------
+if case_enabled route-preview; then
+  header "R11. --route-preview"
+  d=$(new_case route-preview)
+  rc=$(run_ralph "$d" ok --route-preview)
+  assert_eq 0 "$rc" "exit 0"
+  assert_contains "$d/out.log" "PREVIEW OFFLINE: SIMULACAO, nao e decisao do JEV" "offline rotulado como simulacao"
+  assert_contains "$d/out.log" "Phase 1: Foundation [impl]" "decisao por fase e modo"
+  assert_contains "$d/out.log" "Phase 2: Feature [verify]" "inclui o verificador"
+  assert_eq 0 "$(n_calls "$d" impl)" "nenhum agente foi chamado"
+  assert_eq 0 "$(jev_n "$d")" "preview offline nao consulta o JEV"
+  assert_eq 1 "$(commits "$d")" "nenhum commit"
+  d2=$(new_case route-preview-live)
+  rc=$(run_ralph "$d2" ok --route-preview --route-live)
+  assert_eq 0 "$rc" "exit 0 (ao vivo)"
+  assert_contains "$d2/out.log" "PREVIEW AO VIVO" "ao vivo rotulado"
+  assert_eq 4 "$(jev_n "$d2")" "ao vivo: uma consulta por fase e modo"
+  assert_eq 0 "$(n_calls "$d2" impl)" "ao vivo tambem nao chama agente"
+  # kit ausente: o preview offline continua funcionando; o ao vivo falha fechado
+  d3=$(new_case route-preview-nokit)
+  rc=$(CASE_KIT="$d3/kit-inexistente" run_ralph "$d3" ok --route-preview)
+  assert_eq 0 "$rc" "preview offline com HARNESS_KIT inexistente: exit 0"
+  assert_contains "$d3/out.log" "PREVIEW OFFLINE: SIMULACAO" "kit ausente: continua rotulado como simulacao"
+  assert_not_contains "$d3/out.log" "decisor" "kit ausente: nenhuma reclamacao do decisor no offline"
+  d4=$(new_case route-preview-live-nokit)
+  rc=$(CASE_KIT="$d4/kit-inexistente" run_ralph "$d4" ok --route-preview --route-live)
+  assert_eq 1 "$rc" "preview ao vivo com kit ausente falha (exit 1)"
+  assert_contains "$d4/out.log" "decisor" "ao vivo sem kit explica a falta do decisor"
+fi
+
+# ---------------------------------------------------------------------------
+# R12. chave do JEV ausente: pergunta ANTES de qualquer agente/.phases, uma vez so, e grava
+#      no .env da pasta (fora do git). Terminal FALSO (RALPH_JEV_CREDENTIAL_MODULE): sem TTY aqui.
+#      O decisor falso do kit confere que a chave que o ROTEADOR carregou do .env e a digitada.
+# ---------------------------------------------------------------------------
+# write_fake_term <arq> <log> <interativo 0|1> <resposta> — cada pergunta vira uma linha "pedir"
+write_fake_term() {
+  local lg="$2"
+  if command -v cygpath &> /dev/null; then lg=$(cygpath -m "$2"); fi  # node no Windows nao entende /tmp
+  cat > "$1" <<TERM
+const fs = require('fs');
+exports.interativo = () => $3 === 1;
+exports.pedir = async () => { fs.appendFileSync('$lg', 'pedir\n'); return '$4'; };
+TERM
+}
+cred_n() { if [ -f "$1" ]; then grep -ac "^$2" "$1" || true; else echo 0; fi; }
+# chave_vista_n <dir>: consultas ao JEV em que a chave vista pelo decisor era a esperada
+chave_vista_n() { if [ -f "$1/state/jev.log" ]; then grep -ac '"chaveConfere":true' "$1/state/jev.log" || true; else echo 0; fi; }
+# untracked .env: o repo do caso ja tem /.env em info/exclude (como o helper deixaria)
+com_env() { printf '%s' "$2" > "$1/repo/.env"; echo '/.env' >> "$1/repo/.git/info/exclude"; }
+
+if case_enabled route-credential; then
+  header "R12. chave do JEV ausente"
+  CHAVE_R12="dummy-r12-chave#com=simbolos"
+  d=$(new_case route-credential)
+  write_fake_term "$d/term.js" "$d/term.log" 1 "$CHAVE_R12"
+  rc=$(CASE_KEY="" FAKE_JEV_EXPECT_KEY="$CHAVE_R12" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "interativo + chave ausente: grava no .env e segue o MESMO run"
+  assert_eq 1 "$(cred_n "$d/term.log" pedir)" "perguntou uma unica vez"
+  assert_contains "$d/out.log" "Chave salva no .env" "avisou onde a chave ficou"
+  assert_not_contains "$d/out.log" "$CHAVE_R12" "chave nao aparece na saida"
+  assert_contains "$d/repo/.env" "TYPESAFE_API_KEY=" "linha da chave gravada no .env"
+  assert_eq 4 "$(jev_n "$d")" "depois de gravar o roteamento consultou o JEV normalmente"
+  assert_eq 4 "$(chave_vista_n "$d")" "o roteador carregou a chave do .env no proprio processo (sem reiniciar)"
+  assert_eq "" "$(git -C "$d/repo" ls-files .env)" ".env nunca entrou no git"
+  if git -C "$d/repo" check-ignore -q .env; then ok ".env ignorado (info/exclude) antes dos commits do ralph"; else bad ".env nao esta ignorado"; fi
+
+  d=$(new_case route-credential-reuse)
+  com_env "$d" 'TYPESAFE_API_KEY="dummy-r12-reuso"
+'
+  write_fake_term "$d/term.js" "$d/term.log" 1 "outra-chave"
+  rc=$(CASE_KEY="" FAKE_JEV_EXPECT_KEY="dummy-r12-reuso" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" ".env ja com chave: segue sem perguntar"
+  assert_eq 0 "$(cred_n "$d/term.log" pedir)" "nao perguntou"
+  assert_eq 4 "$(chave_vista_n "$d")" "decisor viu a chave do .env"
+
+  d=$(new_case route-credential-notty)
+  write_fake_term "$d/term.js" "$d/term.log" 0 "x"
+  rc=$(CASE_KEY="" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "sem terminal + chave ausente: exit 1"
+  assert_contains "$d/out.log" "TYPESAFE_API_KEY" "orientacao acionavel"
+  assert_eq 0 "$(cred_n "$d/term.log" pedir)" "nada perguntado"
+  assert_eq 0 "$(n_calls "$d" impl)" "nenhum agente rodou"
+  assert_eq 0 "$(jev_n "$d")" "nenhuma consulta ao JEV"
+  if [ ! -f "$d/repo/.env" ]; then ok ".env nao foi criado"; else bad ".env criado sem terminal"; fi
+  if [ ! -d "$d/repo/.phases" ]; then ok ".phases nao foi criado"; else bad ".phases criado antes da checagem de chave"; fi
+
+  d=$(new_case route-credential-cancel)
+  write_fake_term "$d/term.js" "$d/term.log" 1 ""
+  rc=$(CASE_KEY="" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "vazio/cancelado: exit 1"
+  assert_contains "$d/out.log" "nada foi gravado" "mensagem clara"
+  assert_eq 1 "$(cred_n "$d/term.log" pedir)" "sem segunda tentativa"
+  assert_eq 0 "$(n_calls "$d" impl)" "nenhum agente rodou"
+  if [ ! -f "$d/repo/.env" ]; then ok ".env nao foi criado"; else bad "cancelar criou .env"; fi
+
+  d=$(new_case route-credential-tracked)
+  printf 'TYPESAFE_API_KEY=\n' > "$d/repo/.env"
+  git -C "$d/repo" add .env && git -C "$d/repo" commit -q -m "fixture: .env rastreado"
+  write_fake_term "$d/term.js" "$d/term.log" 1 "dummy-nao-grava"
+  rc=$(CASE_KEY="" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" ".env rastreado sem chave: recusa"
+  assert_contains "$d/out.log" "git rm --cached .env" "explica como tirar do controle"
+  assert_eq 0 "$(cred_n "$d/term.log" pedir)" "nao perguntou"
+  assert_eq 'TYPESAFE_API_KEY=' "$(tr -d '\r\n' < "$d/repo/.env")" ".env rastreado intacto"
+
+  d=$(new_case route-credential-fallback)
+  write_fake_term "$d/term.js" "$d/term.log" 0 "x"
+  rc=$(CASE_KEY="" FAKE_JEV_FAIL=1 RALPH_ROUTER_ON_FAIL=low RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --engine codex --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "RALPH_ROUTER_ON_FAIL explicito sem terminal: fallback preservado"
+  assert_eq 0 "$(cred_n "$d/term.log" pedir)" "fallback nao pergunta"
+
+  d=$(new_case route-credential-offline)
+  write_fake_term "$d/term.js" "$d/term.log" 1 "x"
+  rc=$(CASE_KEY="" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --route-preview)
+  assert_eq 0 "$rc" "preview offline sem chave: exit 0"
+  rc=$(CASE_KEY="" RALPH_ROUTER_OFFLINE=1 RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 0 "$rc" "RALPH_ROUTER_OFFLINE=1 sem chave: exit 0"
+  if [ ! -f "$d/term.log" ] && [ ! -f "$d/repo/.env" ]; then ok "offline nunca perguntou nem criou .env"; else bad "offline tocou na credencial"; fi
+
+  d=$(new_case route-credential-live)
+  write_fake_term "$d/term.js" "$d/term.log" 1 "dummy-r12-live"
+  rc=$(CASE_KEY="" FAKE_JEV_EXPECT_KEY="dummy-r12-live" RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --route-preview --route-live)
+  assert_eq 0 "$rc" "preview ao vivo: pergunta e consulta"
+  assert_eq 1 "$(cred_n "$d/term.log" pedir)" "preview ao vivo perguntou uma vez"
+  assert_eq 4 "$(jev_n "$d")" "consulta ao JEV depois da pergunta"
+  assert_eq 4 "$(chave_vista_n "$d")" "preview ao vivo usou a chave recem gravada"
+
+  d=$(new_case route-credential-authfail)
+  com_env "$d" 'OUTRA=1
+TYPESAFE_API_KEY=dummy-r12-recusada
+'
+  write_fake_term "$d/term.js" "$d/term.log" 1 "nova-chave"
+  rc=$(CASE_KEY="" FAKE_JEV_FAIL=1 RALPH_JEV_CREDENTIAL_MODULE="$d/term.js" run_ralph "$d" ok --test-cmd "$d/test.sh")
+  assert_eq 1 "$rc" "chave presente mas JEV recusou: aborta (fail-closed)"
+  assert_eq 0 "$(cred_n "$d/term.log" pedir)" "falha do JEV nao e chave ausente: sem prompt"
+  assert_contains "$d/repo/.env" "dummy-r12-recusada" ".env nao foi sobrescrito"
 fi
 
 # ---------------------------------------------------------------------------
